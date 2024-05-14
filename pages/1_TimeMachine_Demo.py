@@ -19,11 +19,18 @@ import numpy as np
 import streamlit as st
 from streamlit.hello.utils import show_code
 
-from llama_index.vector_stores import TimescaleVectorStore
-from llama_index import ServiceContext, StorageContext
-from llama_index.indices.vector_store import VectorStoreIndex
-from llama_index.llms import OpenAI
-from llama_index import set_global_service_context
+from llama_index.vector_stores.timescalevector import TimescaleVectorStore
+
+# from llama_index import ServiceContext, StorageContext
+from llama_index.core import VectorStoreIndex
+
+# from llama_index.llms import OpenAI
+# from llama_index import set_global_service_context
+
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.llms.openai import OpenAI
+from llama_index.core import ServiceContext, StorageContext, set_global_service_context
 
 import pandas as pd
 from pathlib import Path
@@ -32,9 +39,10 @@ from timescale_vector import client
 
 from typing import List, Tuple
 
-from llama_index.schema import TextNode
-from llama_index.embeddings import OpenAIEmbedding
+from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
+from llama_index.embeddings.openai import OpenAIEmbedding
 import psycopg2
+
 
 def get_repos():
     with psycopg2.connect(dsn=st.secrets["TIMESCALE_SERVICE_URL"]) as connection:
@@ -55,8 +63,10 @@ def get_repos():
 
             return catalog_dict
 
+
 def get_auto_retriever(index, retriever_args):
     from llama_index.vector_stores.types import MetadataInfo, VectorStoreInfo
+
     vector_store_info = VectorStoreInfo(
         content_info="Description of the commits to PostgreSQL. Describes changes made to Postgres",
         metadata_info=[
@@ -74,97 +84,125 @@ def get_auto_retriever(index, retriever_args):
                 name="__start_date",
                 type="datetime in iso format",
                 description="All results will be after this datetime",
-    
             ),
             MetadataInfo(
                 name="__end_date",
                 type="datetime in iso format",
                 description="All results will be before this datetime",
-    
-            )
+            ),
         ],
     )
     from llama_index.indices.vector_store.retrievers import VectorIndexAutoRetriever
-    retriever = VectorIndexAutoRetriever(index, 
-                                         vector_store_info=vector_store_info, 
-                                         service_context=index.service_context,
-                                         **retriever_args)
-    
+
+    retriever = VectorIndexAutoRetriever(
+        index,
+        vector_store_info=vector_store_info,
+        service_context=index.service_context,
+        **retriever_args,
+    )
+
     # build query engine
     from llama_index.query_engine.retriever_query_engine import RetrieverQueryEngine
+
     query_engine = RetrieverQueryEngine.from_args(
         retriever=retriever, service_context=index.service_context
     )
 
     from llama_index.tools.query_engine import QueryEngineTool
+
     # convert query engine to tool
     query_engine_tool = QueryEngineTool.from_defaults(query_engine=query_engine)
 
     from llama_index.agent import OpenAIAgent
+
     chat_engine = OpenAIAgent.from_tools(
         tools=[query_engine_tool],
         llm=index.service_context.llm,
-        verbose=True
-        #service_context=index.service_context
+        verbose=True,
+        # service_context=index.service_context
     )
     return chat_engine
+
 
 def tm_demo():
     repos = get_repos()
 
-    months = st.sidebar.slider('How many months back to search (0=no limit)?', 0, 130, 0)
+    months = st.sidebar.slider(
+        "How many months back to search (0=no limit)?", 0, 130, 0
+    )
 
-    if "config_months" not in st.session_state.keys() or months != st.session_state.config_months:
+    if (
+        "config_months" not in st.session_state.keys()
+        or months != st.session_state.config_months
+    ):
         st.session_state.clear()
 
-    topk = st.sidebar.slider('How many commits to retrieve', 1, 150, 20)
-    if "config_topk" not in st.session_state.keys() or topk != st.session_state.config_topk:
+    topk = st.sidebar.slider("How many commits to retrieve", 1, 150, 20)
+    if (
+        "config_topk" not in st.session_state.keys()
+        or topk != st.session_state.config_topk
+    ):
         st.session_state.clear()
-        
+
     if len(repos) > 0:
         repo = st.sidebar.selectbox("Choose a repo", repos.keys())
     else:
         st.error("No repositiories found, please [load some data first](/LoadData)")
         return
-    
-    if "config_repo" not in st.session_state.keys() or repo != st.session_state.config_repo:
+
+    if (
+        "config_repo" not in st.session_state.keys()
+        or repo != st.session_state.config_repo
+    ):
         st.session_state.clear()
-    
+
     st.session_state.config_months = months
     st.session_state.config_topk = topk
     st.session_state.config_repo = repo
 
-
-    if "messages" not in st.session_state.keys(): # Initialize the chat messages history
+    if (
+        "messages" not in st.session_state.keys()
+    ):  # Initialize the chat messages history
         st.session_state.messages = [
-            {"role": "assistant", "content": "Please choose a repo and time filter on the sidebar and then ask me a question about the git history"}
+            {
+                "role": "assistant",
+                "content": "Please choose a repo and time filter on the sidebar and then ask me a question about the git history",
+            }
         ]
 
     vector_store = TimescaleVectorStore.from_params(
         service_url=st.secrets["TIMESCALE_SERVICE_URL"],
         table_name=repos[repo],
         time_partition_interval=timedelta(days=7),
-    );
+    )
 
-    service_context = ServiceContext.from_defaults(llm=OpenAI(model="gpt-4", temperature=0.1))
+    service_context = ServiceContext.from_defaults(
+        llm=OpenAI(model="gpt-4", temperature=0.1)
+    )
     set_global_service_context(service_context)
-    index = VectorStoreIndex.from_vector_store(vector_store=vector_store, service_context=service_context)
-    
-        
-    #chat engine goes into the session to retain history
-    if "chat_engine" not in st.session_state.keys(): # Initialize the chat engine
-        retriever_args = {"similarity_top_k" : int(topk)}
+    index = VectorStoreIndex.from_vector_store(
+        vector_store=vector_store, service_context=service_context
+    )
+
+    # chat engine goes into the session to retain history
+    if "chat_engine" not in st.session_state.keys():  # Initialize the chat engine
+        retriever_args = {"similarity_top_k": int(topk)}
         if months > 0:
             end_dt = datetime.now()
-            start_dt = end_dt - timedelta(weeks=4*months)
-            retriever_args["vector_store_kwargs"] = ({"start_date": start_dt, "end_date":end_dt})
+            start_dt = end_dt - timedelta(weeks=4 * months)
+            retriever_args["vector_store_kwargs"] = {
+                "start_date": start_dt,
+                "end_date": end_dt,
+            }
         st.session_state.chat_engine = get_auto_retriever(index, retriever_args)
-        #st.session_state.chat_engine = index.as_chat_engine(chat_mode="best", similarity_top_k=20, verbose=True)
+        # st.session_state.chat_engine = index.as_chat_engine(chat_mode="best", similarity_top_k=20, verbose=True)
 
-    if prompt := st.chat_input("Your question"): # Prompt for user input and save to chat history
+    if prompt := st.chat_input(
+        "Your question"
+    ):  # Prompt for user input and save to chat history
         st.session_state.messages.append({"role": "user", "content": prompt})
 
-    for message in st.session_state.messages: # Display the prior chat messages
+    for message in st.session_state.messages:  # Display the prior chat messages
         with st.chat_message(message["role"]):
             st.write(message["content"])
 
@@ -172,10 +210,15 @@ def tm_demo():
     if st.session_state.messages[-1]["role"] != "assistant":
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                response = st.session_state.chat_engine.chat(prompt, function_call="query_engine_tool")
+                response = st.session_state.chat_engine.chat(
+                    prompt, function_call="query_engine_tool"
+                )
                 st.write(response.response)
                 message = {"role": "assistant", "content": response.response}
-                st.session_state.messages.append(message) # Add response to message history
+                st.session_state.messages.append(
+                    message
+                )  # Add response to message history
+
 
 st.set_page_config(page_title="Time machine demo", page_icon="🧑‍💼")
 st.markdown("# Time Machine")
@@ -191,4 +234,4 @@ if debug_llamaindex:
 
 tm_demo()
 
-#show_code(tm_demo)
+# show_code(tm_demo)
